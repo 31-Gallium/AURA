@@ -1,62 +1,72 @@
-import os
-import importlib.util
+# command_handler.py
 import re
+import traceback
+import os
+import importlib
 
 class CommandHandler:
     def __init__(self, app_controller):
         self.app = app_controller
         self.log = self.app.queue_log
-        self.skills = {}
+        self.command_map = {}
         self._load_skills()
 
     def _load_skills(self):
+        """Loads all skills and their regex commands from the skills directory."""
+        self.log("Loading skill commands for Hybrid Engine...")
+        self.command_map.clear()
         skills_dir = "skills"
-        if not os.path.exists(skills_dir):
-            return
+        enabled_skills = self.app.config.get("enabled_skills", {})
 
-        self.skills.clear()
         for filename in os.listdir(skills_dir):
             if filename.endswith(".py") and not filename.startswith("__"):
+                if not enabled_skills.get(filename, True):
+                    continue
+                
+                skill_name = filename[:-3]
+                module_name = f"skills.{skill_name}"
                 try:
-                    path = os.path.join(skills_dir, filename)
-                    module_name = f"skills.{filename[:-3]}"
-                    spec = importlib.util.spec_from_file_location(module_name, path)
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
-                    if hasattr(module, 'register'):
-                        self.skills.update(module.register())
-                        self.log(f"Successfully loaded skill: {filename}")
+                    skill_module = importlib.import_module(module_name)
+                    importlib.reload(skill_module)
+                    if hasattr(skill_module, 'register'):
+                        # Add all registered commands to the map
+                        self.command_map.update(skill_module.register())
                 except Exception as e:
-                    self.log(f"Failed to load skill '{filename}': {e}")
-    
+                    self.log(f"ERROR loading skill '{skill_name}': {e}\n{traceback.format_exc()}", "ERROR")
+        self.log("Hybrid Engine regex commands loaded.")
+
     def handle(self, command, attached_file=None):
         """
-        Finds and executes the best matching skill by iterating through regex patterns.
+        Attempts to handle a command using direct regex matching.
+        Returns a response string if a match is found, otherwise returns None.
         """
-        command_lower = command.lower()
-
-        # Iterate through all registered skills
-        for skill_name, info in self.skills.items():
-            regex_pattern = info.get('regex')
+        command_lower = command.lower().strip()
+        
+        # Iterate through a sorted list for predictable behavior
+        for cmd_name in sorted(self.command_map.keys()):
+            cmd_data = self.command_map[cmd_name]
+            regex_pattern = cmd_data.get('regex')
+            
+            # Skip skills that are meant to be AI-only tools
             if not regex_pattern:
                 continue
 
-            # Check if the command matches the skill's regex
-            match = re.search(regex_pattern, command_lower)
-            if match:
-                self.log(f"Regex match found for skill: '{skill_name}'")
-                
-                captured_groups = match.groups()
-                param_names = info.get('params', [])
-                params_dict = dict(zip(param_names, captured_groups))
-
-                try:
-                    # Call the handler with the extracted parameters
-                    return info['handler'](self.app, **params_dict)
-                except TypeError as e:
-                    self.log(f"TypeError calling handler for '{skill_name}': {e}.")
-                    return "I understood the command, but there was a parameter error."
-
-        # If the loop finishes with no matches, fall back to the main app controller.
-        self.log(f"Command '{command}' could not be matched to any skill regex.")
+            try:
+                match = re.search(regex_pattern, command_lower, re.IGNORECASE)
+                if match:
+                    self.log(f"Hybrid Engine: Direct regex match found for skill '{cmd_name}'.")
+                    
+                    handler_func = cmd_data['handler']
+                    param_names = cmd_data.get('params', [])
+                    
+                    kwargs = {name: match.group(i + 1) for i, name in enumerate(param_names)}
+                    kwargs['command'] = command
+                    kwargs['attached_file'] = attached_file
+                    
+                    return handler_func(self.app, **kwargs)
+            except Exception as e:
+                self.log(f"ERROR executing regex-matched skill '{cmd_name}': {e}\n{traceback.format_exc()}", "ERROR")
+                continue
+        
+        # If no regex pattern matched after checking all skills, return None
         return None

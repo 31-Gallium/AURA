@@ -1,14 +1,16 @@
-# In main.py
-import sys
+# main.py
 from app_controller import AURAApp
+from multiprocessing import freeze_support
+import traceback
 
 if __name__ == "__main__":
-    app = AURAApp()
+    # freeze_support() is necessary for creating executables with multiprocessing
+    freeze_support()
+    try:
+        app = AURAApp()
+        app.run()
+    except Exception as e:
+        # Log any critical error that prevents the app from even starting
+        print(f"A critical error occurred during application startup: {e}")
+        traceback.print_exc()
 
-    # Check if the --startup flag was passed when the script was run
-    if "--startup" in sys.argv:
-        # If so, call a special method in our controller
-        app.run_startup_routine()
-    
-    # Always run the main GUI loop to show the window
-    app.run()
