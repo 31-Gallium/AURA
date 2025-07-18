@@ -59,13 +59,15 @@ def register():
     return {
         'launch_app': {
             'handler': launch_app,
-            'regex': r'\b(?:open|launch|start)\b\s(?:an? )?(.+?)(?:\s(?:app|application))?$',
+            # FIX: Anchored the regex to the start of the string with ^\s*
+            'regex': r'^\s*(?:open|launch|start)\b\s(?:an? )?(.+?)(?:\s(?:app|application))?$',
             'params': ['app_name'],
             'description': "Opens or launches a specific application on the computer."
         },
         'close_app': {
             'handler': close_app,
-            'regex': r'\b(?:close|quit|exit|terminate)\b\s(?:the\s)?(.+?)(?:\s(?:app|application))?$',
+            # FIX: Anchored the regex to the start of the string with ^\s*
+            'regex': r'^\s*(?:close|quit|exit|terminate)\b\s(?:the\s)?(.+?)(?:\s(?:app|application))?$',
             'params': ['app_name'],
             'description': "Closes or terminates a running application on the computer."
         }

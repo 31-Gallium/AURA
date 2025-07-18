@@ -48,13 +48,14 @@ def register():
     return {
         'get_weather_in_city': {
             'handler': get_weather,
-            'regex': r'\bwhat(?:\'s| is) the (?:weather|temperature)(?: like)? in (.+)\b',
+            'regex': r'^\s*what(?:\'s| is) the (?:weather|temperature)(?: like)? in (.+)',
             'params': ['city'],
             'description': "Gets the current weather for a specific city."
         },
         'get_weather_default': {
             'handler': get_weather,
-            'regex': r'\bwhat(?:\'s| is) the (?:weather|temperature)\b',
+            # FIX: Added '$' to anchor the match to the end of the string.
+            'regex': r'^\s*what(?:\'s| is) the (?:weather|temperature)\s*$',
             'params': [],
             'description': "Gets the current weather for the user's default location if no city is specified."
         }

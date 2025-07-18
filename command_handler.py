@@ -35,6 +35,21 @@ class CommandHandler:
                     self.log(f"ERROR loading skill '{skill_name}': {e}\n{traceback.format_exc()}", "ERROR")
         self.log("Hybrid Engine regex commands loaded.")
 
+    # --- NEW METHOD ---
+    def get_tools_for_ai(self):
+        """Generates a list of all available skills formatted as tools for the AI."""
+        tools = []
+        for name, data in self.command_map.items():
+            # Only expose skills that have a description (the AI needs it to understand the tool)
+            if data.get('description'):
+                tool_info = {
+                    "name": name,
+                    "description": data['description'],
+                    "parameters": {param: "string" for param in data.get('params', [])}
+                }
+                tools.append(tool_info)
+        return tools
+
     def handle(self, command, attached_file=None):
         """
         Attempts to handle a command using direct regex matching.
@@ -52,13 +67,15 @@ class CommandHandler:
                 continue
 
             try:
-                match = re.search(regex_pattern, command_lower, re.IGNORECASE)
-                if match:
+                # --- FIX: Anchored regex to prevent accidental mid-sentence matches ---
+                if re.match(r'^\s*' + regex_pattern.lstrip('^'), command_lower, re.IGNORECASE):
                     self.log(f"Hybrid Engine: Direct regex match found for skill '{cmd_name}'.")
                     
                     handler_func = cmd_data['handler']
                     param_names = cmd_data.get('params', [])
                     
+                    # We need to re-run the search to get the match object for parameters
+                    match = re.search(regex_pattern, command_lower, re.IGNORECASE)
                     kwargs = {name: match.group(i + 1) for i, name in enumerate(param_names)}
                     kwargs['command'] = command
                     kwargs['attached_file'] = attached_file

@@ -24,6 +24,8 @@ from logging import LogRecord
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+from skills import web_skill as web
+
 import queue
 from gui import AutoWrappingText
 
@@ -75,6 +77,7 @@ class AURAApp:
         self.is_listening = False
         self.speaking_active = False
         self.is_mic_testing = False
+        self.is_executing_command = False
         self.loading_failed = False
         self.is_tts_reinitializing = False
         self.stop_generating_event = threading.Event()
@@ -260,19 +263,24 @@ class AURAApp:
             models_to_load = []
             if preload_setting in ["Creator AI Only", "Both"]:
                 models_to_load.append(self.config.get("ollama_model", "llama3.1"))
-            # Note: The 'aura-router' model is no longer used in the Hybrid system
             
             def preloader_task():
                 import time
-                from ai_logic import get_ollama_streaming_response
+                # --- FIX: Import the correct, new function ---
+                from ai_logic import get_ollama_chat_response
+
                 for model_name in models_to_load:
                     self.queue_log(f"Warming up model: {model_name}...")
-                    try:
-                        # Send a trivial prompt to force the model to load
-                        list(get_ollama_streaming_response(self, "hello", model_name))
+                    
+                    # --- FIX: Use the new chat function and check its result ---
+                    messages = [{"role": "user", "content": "hello"}]
+                    result = get_ollama_chat_response(self, messages, model_name)
+                    
+                    if result is not None:
                         self.queue_log(f"Successfully preloaded {model_name}.")
-                    except Exception as e:
-                        self.queue_log(f"Failed to preload model {model_name}: {e}", "ERROR")
+                    else:
+                        self.queue_log(f"Failed to preload model {model_name}. Please ensure Ollama is running and the model is available.", "ERROR")
+                    
                     time.sleep(1)
             
             threading.Thread(target=preloader_task, daemon=True).start()
@@ -634,21 +642,22 @@ class AURAApp:
 
     def execute_command(self, command, attached_file=None):
         """Executes a command in a background thread."""
+        if self.is_executing_command: # NEW CHECK
+            self.queue_log("Command already in progress. Ignoring new command.", level='WARNING')
+            return
+
         if self.gui: self.gui.update_status("Thinking...")
         threading.Thread(target=self._execute_command_task, args=(command, attached_file), daemon=True).start()
 
-    # In app_controller.py, REPLACE the existing _execute_command_task method
-
     def _execute_command_task(self, cmd, file_path):
         """New Hybrid Flow: Tries regex first, then falls back to AI."""
+        self.is_executing_command = True
         pythoncom.CoInitialize()
         try:
             # --- Step 1: Try to handle the command with a simple, fast regex skill ---
             skill_response = self.command_handler.handle(cmd, attached_file=file_path)
 
             if skill_response is not None:
-                # SUCCESS: A direct skill was found and executed.
-                # --- FIX: Changed self.log to self.queue_log ---
                 self.queue_log(f"Command '{cmd}' handled by a direct skill.")
                 self.conversation_history.append({"role": "user", "parts": [cmd]})
                 self.conversation_history.append({"role": "model", "parts": [skill_response]})
@@ -659,12 +668,13 @@ class AURAApp:
                 return
 
             # --- Step 2: If no skill matched, fall back to the conversational AI ---
-            # --- FIX: Changed self.log to self.queue_log ---
             self.queue_log(f"No direct skill matched for '{cmd}'. Passing to conversational AI.")
             self.root.after(0, self.gui.update_action_button, "generating")
             self.root.after(0, self.gui.update_status, "AURA is thinking...")
             self.stop_generating_event.clear()
 
+            # The new get_ai_response now handles history internally via its `messages` param
+            # We pass the existing history and the new prompt.
             response_stream, full_response_future = get_ai_response(self, self.conversation_history, cmd)
 
             aura_bubble_widget = self.gui.add_chat_message("AURA", "")
@@ -672,6 +682,7 @@ class AURAApp:
                 aura_bubble_widget.start_typewriter_animation()
 
             sentence_buffer = ""
+            # Since the new function is not streaming, this loop will execute once with the full text
             for chunk in response_stream:
                 if self.stop_generating_event.is_set(): break
                 for char in chunk:
@@ -689,14 +700,23 @@ class AURAApp:
             if self.stop_generating_event.is_set(): return
 
             full_text = full_response_future.result(timeout=120)
-            self.conversation_history.append({"role": "user", "parts": [cmd]})
-            self.conversation_history.append({"role": "model", "parts": [full_text]})
+            
+            # --- IMPORTANT: Update conversation history format ---
+            # The prompt is now passed as `content` not `parts` to align with Ollama's API
+            self.conversation_history.append({"role": "user", "content": cmd})
+            self.conversation_history.append({"role": "model", "content": full_text})
+            
+            # Limit history size to prevent excessively long prompts
+            if len(self.conversation_history) > 10:
+                self.conversation_history = self.conversation_history[-10:]
+
             self.update_ai_monitor(full_text)
 
         except Exception as e:
             self.queue_log(f"Error executing command task: {e}\n{traceback.format_exc()}", "ERROR")
             if self.is_running: self.root.after(0, lambda: self.speak_response("I ran into an error processing that."))
         finally:
+            self.is_executing_command = False # SET FLAG FALSE
             # The on_speak_done_wrapper now handles returning to idle state
             pythoncom.CoUninitialize()
 

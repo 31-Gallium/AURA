@@ -22,8 +22,8 @@ def perform_web_search(app, query, **kwargs):
     app.queue_log(f"Performing web search for: {query}")
     try:
         with DDGS() as ddgs:
-            # Fetch 5 results to get a good amount of context
-            results = [r for r in ddgs.text(query, max_results=5)]
+            # Fetch more results to increase the chance of finding relevant context
+            results = [r for r in ddgs.text(query, max_results=10)] # Changed from 5 to 10
         
         if not results:
             return "I couldn't find any web results for that query."
