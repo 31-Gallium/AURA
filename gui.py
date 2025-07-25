@@ -1032,8 +1032,25 @@ class GUI:
         self.weather_api_key_entry = create_entry(keys_frame, "OpenWeather API Key:", 1)
         keys_frame.columnconfigure(1, weight=1)
 
-        engine_frame = ttk.Labelframe(frame, text="Conversational AI Engine", pad=10)
+        engine_frame = ttk.Labelframe(frame, text="AI Model Configuration", pad=10)
         engine_frame.pack(fill="x", expand=True, pady=(0, 15))
+        
+        # --- WIDGETS CHANGED TO COMBOBOX (DROPDOWN) ---
+        self.router_model_var = tk.StringVar()
+        self.chat_model_var = tk.StringVar()
+
+        # Router Model Dropdown
+        ttk.Label(engine_frame, text="Router Model:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        self.router_model_combo = ttk.Combobox(engine_frame, textvariable=self.router_model_var, values=self.app.ollama_models_list)
+        self.router_model_combo.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+
+        # Chat Model Dropdown
+        ttk.Label(engine_frame, text="Chat Model:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        self.chat_model_combo = ttk.Combobox(engine_frame, textvariable=self.chat_model_var, values=self.app.ollama_models_list)
+        self.chat_model_combo.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+
+        engine_frame.columnconfigure(1, weight=1)
+        # --- END OF WIDGET CHANGES ---
 
         preload_frame = ttk.Labelframe(frame, text="AI Model Performance", pad=10)
         preload_frame.pack(fill="x", expand=True, pady=(0, 15))
@@ -1041,17 +1058,16 @@ class GUI:
         self.preload_models_var = tk.StringVar()
         ttk.Label(preload_frame, text="Model Preloading (requires restart):").pack(anchor="w", pady=(0,5))
         
-        ttk.Radiobutton(preload_frame, text="None (Load models on demand, saves memory)", variable=self.preload_models_var, value="None").pack(anchor="w")
-        ttk.Radiobutton(preload_frame, text="Preload Main AI (Faster first response, uses more memory)", variable=self.preload_models_var, value="Creator AI Only").pack(anchor="w")
-        
-        ttk.Radiobutton(engine_frame, text="Gemini (Online, Requires API Key)", variable=self.ai_engine_var, value="gemini_online").pack(anchor="w")
-        ttk.Radiobutton(engine_frame, text="Ollama (Offline, Requires Ollama running)", variable=self.ai_engine_var, value="ollama_offline").pack(anchor="w")
+        ttk.Radiobutton(preload_frame, text="None (Load on demand)", variable=self.preload_models_var, value="None").pack(anchor="w")
+        ttk.Radiobutton(preload_frame, text="Preload Router Model Only", variable=self.preload_models_var, value="Router Model Only").pack(anchor="w")
+        ttk.Radiobutton(preload_frame, text="Preload Chat Model Only", variable=self.preload_models_var, value="Chat Model Only").pack(anchor="w")
+        ttk.Radiobutton(preload_frame, text="Preload Both Models", variable=self.preload_models_var, value="Both").pack(anchor="w")
 
         paths_frame = ttk.Labelframe(frame, text="Model Paths", pad=10)
         paths_frame.pack(fill="x", expand=True)
 
         self.whisper_path_entry = create_entry(paths_frame, "Whisper Model Path:", 0)
-        self.ollama_model_entry = create_entry(paths_frame, "Ollama Model Name:", 1)
+        self.ollama_model_entry = create_entry(paths_frame, "Fallback Ollama Model:", 1)
         paths_frame.columnconfigure(1, weight=1)
 
     def _populate_dynamic_list(self, parent, labels, add_row_func, list_ref, inner_frame_attr):
@@ -1477,11 +1493,14 @@ class GUI:
         self.stt_engine_var.set(audio_config.get("stt_engine", "google_online"))
         self.continuous_listening_var.set(audio_config.get("continuous_listening", False))
 
-        self.ai_engine_var.set(config.get("ai_engine", "gemini_online"))
         self.ollama_model_entry.delete(0, tk.END)
-        self.ollama_model_entry.insert(0, config.get("ollama_model", "llama3"))
+        self.ollama_model_entry.insert(0, config.get("ollama_model", "llama3")) # Fallback model
 
+        # --- Load NEW Dual-Model Settings ---
+        self.router_model_var.set(config.get("router_model", "phi4:mini"))
+        self.chat_model_var.set(config.get("chat_model", "llama3.1"))
         self.preload_models_var.set(config.get("preload_models", "None"))
+
 
     def get_settings(self):
         new_config = self.app.config.copy()
@@ -1515,10 +1534,11 @@ class GUI:
             "loopback_device_name": selected_loopback_name, "loopback_device_index": loopback_index,
             "stt_engine": self.stt_engine_var.get(), "continuous_listening": self.continuous_listening_var.get()
         }
-
-        new_config["ai_engine"] = self.ai_engine_var.get()
-        new_config["ollama_model"] = self.ollama_model_entry.get().strip()
-
+        
+        # --- Save NEW Dual-Model Settings ---
+        new_config["ollama_model"] = self.ollama_model_entry.get().strip() # Fallback
+        new_config["router_model"] = self.router_model_var.get()
+        new_config["chat_model"] = self.chat_model_var.get()
         new_config["preload_models"] = self.preload_models_var.get()
 
         return new_config

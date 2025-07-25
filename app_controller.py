@@ -28,12 +28,11 @@ from skills import web_skill as web
 
 import queue
 from gui import AutoWrappingText
-
 from gui import GUI
 from stt import SpeechToText
 from command_handler import CommandHandler
 import ai_logic
-from ai_logic import get_ai_response
+from ai_logic import get_tool_decision, get_conversational_response_stream
 
 # --- Logging Setup for Progress ---
 class QueueHandler(logging.Handler):
@@ -49,9 +48,12 @@ class QueueHandler(logging.Handler):
             self.handleError(record)
 
 class AURAApp:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.withdraw()  # Hide the main window initially
+    def __init__(self, use_tk=False): # Add a flag to indicate which UI is running
+        self.root = None
+        if use_tk:
+            self.root = tk.Tk()
+            self.root.withdraw()
+
         self.log_queue = mp_Queue()
         self.animation_data_queue = queue.Queue()
         self.config = self.load_config()
@@ -81,6 +83,7 @@ class AURAApp:
         self.loading_failed = False
         self.is_tts_reinitializing = False
         self.stop_generating_event = threading.Event()
+        self.ollama_models_list = []
         self.last_spoken_text = None
         self.fs_observer = None
         self.clipboard_thread = None
@@ -89,7 +92,7 @@ class AURAApp:
         self.global_hotkey_listener = None
         self._old_config = self.config.copy()
         self.meeting_sessions = {}
-        
+
         def routine_proxy_open_app(**kwargs):
             alias = kwargs.get('alias')
             if alias:
@@ -114,6 +117,33 @@ class AURAApp:
 
         self._initialize_config_defaults()
         self._get_audio_devices()
+
+    def _get_available_tools_json(self):
+        """
+        Generates a JSON string describing the available tools (skills).
+        """
+        tools_list = []
+        for command_name, command_data in self.command_handler.commands.items():
+            # Use the function's docstring as the description
+            description = command_data['function'].__doc__ or f"Executes the {command_name} command."
+            # Clean up the description
+            description = ' '.join(description.strip().split())
+            
+            tools_list.append({
+                "name": command_name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": "The user's request or query to be passed to the tool."
+                        }
+                    },
+                    "required": ["prompt"]
+                }
+            })
+        return json.dumps(tools_list, indent=2)
 
     def run(self):
         """Main entry point to start the application."""
@@ -217,6 +247,7 @@ class AURAApp:
             self.queue_log("Starting background loading...", progress_percent=5)
             ai_logic.load_embedding_model(self.queue_log)
             self.queue_log("Embedding model loaded.", progress_percent=30)
+            self.ollama_models_list = self._get_local_ollama_models()
 
             self.command_handler = CommandHandler(self)
             self.queue_log("Command handler loaded.", progress_percent=70)
@@ -253,37 +284,55 @@ class AURAApp:
         self.root.after(100, self._check_loading_status)
 
     def _preload_ollama_models(self):
-            """Warms up the selected Ollama models to prevent cold start delays."""
-            preload_setting = self.config.get("preload_models", "None")
-            if preload_setting == "None":
-                return
+        """Warms up the selected Ollama models to prevent cold start delays."""
+        preload_setting = self.config.get("preload_models", "None")
+        if preload_setting == "None":
+            return
 
-            self.queue_log(f"Preloading Ollama models based on setting: {preload_setting}")
-            
-            models_to_load = []
-            if preload_setting in ["Creator AI Only", "Both"]:
-                models_to_load.append(self.config.get("ollama_model", "llama3.1"))
-            
-            def preloader_task():
-                import time
-                # --- FIX: Import the correct, new function ---
-                from ai_logic import get_ollama_chat_response
+        self.queue_log(f"Preloading Ollama models based on setting: {preload_setting}")
 
-                for model_name in models_to_load:
-                    self.queue_log(f"Warming up model: {model_name}...")
-                    
-                    # --- FIX: Use the new chat function and check its result ---
-                    messages = [{"role": "user", "content": "hello"}]
-                    result = get_ollama_chat_response(self, messages, model_name)
-                    
-                    if result is not None:
-                        self.queue_log(f"Successfully preloaded {model_name}.")
-                    else:
-                        self.queue_log(f"Failed to preload model {model_name}. Please ensure Ollama is running and the model is available.", "ERROR")
-                    
-                    time.sleep(1)
-            
-            threading.Thread(target=preloader_task, daemon=True).start()
+        models_to_load = set()
+        if preload_setting in ["Router Model Only", "Both"]:
+            models_to_load.add(self.config.get("router_model", "nexusraven:latest"))
+        if preload_setting in ["Chat Model Only", "Both"]:
+            models_to_load.add(self.config.get("chat_model", "llama3.1"))
+
+        if not models_to_load:
+            return
+
+        def preloader_task():
+            from ai_logic import get_ollama_chat_response
+            import time
+
+            for model_name in models_to_load:
+                self.queue_log(f"Warming up model: {model_name}...")
+                
+                messages = [{"role": "user", "content": "hello"}]
+                result = get_ollama_chat_response(self, messages, model_name)
+                
+                if result is not None:
+                    self.queue_log(f"Successfully preloaded {model_name}.")
+                else:
+                    self.queue_log(f"Failed to preload model {model_name}. Ensure Ollama is running.", "ERROR")
+                time.sleep(1)
+        
+        threading.Thread(target=preloader_task, daemon=True).start()
+
+    def _get_local_ollama_models(self):
+        """Fetches the list of locally available Ollama models via the Ollama API."""
+        try:
+            # The /api/tags endpoint lists all local models
+            response = requests.get("http://localhost:11434/api/tags")
+            response.raise_for_status()
+            models_data = response.json()
+            # We extract just the name of each model
+            model_names = [model['name'] for model in models_data.get('models', [])]
+            self.queue_log(f"Found local Ollama models: {model_names}")
+            return model_names
+        except Exception as e:
+            self.queue_log(f"Could not fetch local Ollama models. Is Ollama running? Error: {e}", "WARNING")
+            # Provide a fallback list in case the API call fails
+            return ["llama3:latest", "nexusraven:latest", "phi3:latest"]
 
     def _finish_startup(self):
         """Finalizes the application startup after all components are loaded."""
@@ -419,7 +468,26 @@ class AURAApp:
 
     def _initialize_config_defaults(self):
         """Ensures essential config keys exist."""
-        defaults = self._get_default_config()
+        defaults = {
+            "gemini_api_key": "", "weather_api_key": "",
+            "whisper_model_path": "",
+            "app_paths": {"notepad": "notepad.exe"},
+            "sounds": {
+                "activation": "sounds/activation.wav",
+                "deactivation": "sounds/deactivation.wav",
+            },
+            "audio": {"stt_engine": "google_online", "continuous_listening": False},
+            "hotkeys": [], "enabled_skills": {},
+            "file_system_watcher": {"enabled": False, "path": ""},
+            "clipboard_manager": {"enabled": False},
+            "ai_engine": "ollama_offline", # Defaulting to Ollama as it's the focus
+            "ollama_model": "llama3", # This will now be the fallback/general model
+            "tts": {"speaker_wav_path": "voices/default_voice.wav"},
+            # --- NEW DUAL-MODEL DEFAULTS ---
+            "router_model": "nexusraven:latest",
+            "chat_model": "llama3.1",
+            "preload_models": "None"
+        }
         for key, value in defaults.items():
             self.config.setdefault(key, value)
 
@@ -650,41 +718,87 @@ class AURAApp:
         threading.Thread(target=self._execute_command_task, args=(command, attached_file), daemon=True).start()
 
     def _execute_command_task(self, cmd, file_path):
-        """New Hybrid Flow: Tries regex first, then falls back to AI."""
+        """
+        New Hybrid Flow: Tries fast regex skills first, then falls back to the dual-model AI.
+        """
         self.is_executing_command = True
         pythoncom.CoInitialize()
         try:
-            # --- Step 1: Try to handle the command with a simple, fast regex skill ---
+            # --- Step 1: Try to handle with a simple, fast regex skill ---
             skill_response = self.command_handler.handle(cmd, attached_file=file_path)
 
             if skill_response is not None:
-                self.queue_log(f"Command '{cmd}' handled by a direct skill.")
-                self.conversation_history.append({"role": "user", "parts": [cmd]})
-                self.conversation_history.append({"role": "model", "parts": [skill_response]})
+                self.queue_log(f"Command '{cmd}' handled by a direct regex skill.")
                 if str(skill_response).strip():
-                    self.root.after(0, self.speak_response, skill_response)
-                else: 
+                    self.root.after(0, lambda: self.speak_response(skill_response, on_done=self.return_to_idle_state))
+                else:
                     self.root.after(0, self.return_to_idle_state)
                 return
 
-            # --- Step 2: If no skill matched, fall back to the conversational AI ---
-            self.queue_log(f"No direct skill matched for '{cmd}'. Passing to conversational AI.")
+            # --- Step 2: If no regex skill matched, use the dual-model AI workflow ---
+            self.queue_log(f"No direct skill match. Passing to AI Router.")
             self.root.after(0, self.gui.update_action_button, "generating")
-            self.root.after(0, self.gui.update_status, "AURA is thinking...")
+            self.root.after(0, self.gui.update_status, "AURA: Routing...")
             self.stop_generating_event.clear()
 
-            # The new get_ai_response now handles history internally via its `messages` param
-            # We pass the existing history and the new prompt.
-            response_stream, full_response_future = get_ai_response(self, self.conversation_history, cmd)
+            # === ROUTER: Get Tool Decision ===
+            router_model = self.config.get("router_model", "nexusraven:latest")
+            available_tools = self.command_handler.get_tools_for_ai()
+            
+            decision = get_tool_decision(self, self.conversation_history, cmd, router_model, available_tools)
+            
+            # --- ADDED VALIDATION BLOCK ---
+            # Validate the structure of the decision from the AI
+            if isinstance(decision, dict) and 'tool_name' in decision and 'parameters' in decision:
+                tool_name = decision.get("tool_name")
+                parameters = decision.get("parameters", {})
+            else:
+                # If the AI gives us bad data, log it and safely default to no tool.
+                self.queue_log(f"Invalid decision structure from Router AI: {decision}", "WARNING")
+                tool_name = None
+                parameters = {}
+            # --- END VALIDATION BLOCK ---
+            
+            tool_output = None
 
+            if tool_name and tool_name in self.command_handler.command_map:
+                # === EXECUTOR: Execute the Chosen Tool ===
+                self.queue_log(f"AI Router chose tool: {tool_name} with params: {parameters}")
+                self.root.after(0, self.gui.update_status, f"AURA: Using {tool_name}...")
+                
+                tool_data = self.command_handler.command_map[tool_name]
+                tool_handler = tool_data['handler']
+                tool_result = tool_handler(self, **parameters)
+
+                if isinstance(tool_result, dict) and 'error' in tool_result:
+                    tool_output = tool_result['error']
+                    self.queue_log(f"Tool '{tool_name}' returned an error: {tool_output}", "WARNING")
+                else:
+                    tool_output = str(tool_result)
+            else:
+                self.queue_log("No tool chosen by Router. Proceeding with direct chat.")
+                # No specific tool output, the chat model will handle it conversationally
+                tool_output = None
+
+            # === CHAT: Generate Conversational Response ===
+            self.root.after(0, self.gui.update_status, "AURA: Answering...")
+            chat_model = self.config.get("chat_model", "llama3.1")
+            
+            # Get the streaming generator from our new AI logic function
+            response_stream = get_conversational_response_stream(
+                self, self.conversation_history, cmd, chat_model, tool_output
+            )
+
+            # --- Stream the final response to the GUI and TTS ---
             aura_bubble_widget = self.gui.add_chat_message("AURA", "")
             if aura_bubble_widget:
                 aura_bubble_widget.start_typewriter_animation()
 
             sentence_buffer = ""
-            # Since the new function is not streaming, this loop will execute once with the full text
+            full_response_text = ""
             for chunk in response_stream:
                 if self.stop_generating_event.is_set(): break
+                full_response_text += chunk
                 for char in chunk:
                     if aura_bubble_widget: aura_bubble_widget.char_queue.put(char)
                     sentence_buffer += char
@@ -692,32 +806,26 @@ class AURAApp:
                         to_speak = sentence_buffer.strip()
                         if to_speak: self.speak_response(to_speak)
                         sentence_buffer = ""
-
+            
             if sentence_buffer.strip() and not self.stop_generating_event.is_set():
                 self.speak_response(sentence_buffer.strip())
 
             if aura_bubble_widget: aura_bubble_widget.char_queue.put(None)
             if self.stop_generating_event.is_set(): return
 
-            full_text = full_response_future.result(timeout=120)
-            
-            # --- IMPORTANT: Update conversation history format ---
-            # The prompt is now passed as `content` not `parts` to align with Ollama's API
+            # --- Finalize and update history ---
             self.conversation_history.append({"role": "user", "content": cmd})
-            self.conversation_history.append({"role": "model", "content": full_text})
-            
-            # Limit history size to prevent excessively long prompts
+            self.conversation_history.append({"role": "model", "content": full_response_text})
             if len(self.conversation_history) > 10:
                 self.conversation_history = self.conversation_history[-10:]
 
-            self.update_ai_monitor(full_text)
+            self.update_ai_monitor(full_response_text)
 
         except Exception as e:
             self.queue_log(f"Error executing command task: {e}\n{traceback.format_exc()}", "ERROR")
-            if self.is_running: self.root.after(0, lambda: self.speak_response("I ran into an error processing that."))
+            if self.is_running: self.root.after(0, lambda: self.speak_response("I ran into an error processing that.", on_done=self.return_to_idle_state))
         finally:
-            self.is_executing_command = False # SET FLAG FALSE
-            # The on_speak_done_wrapper now handles returning to idle state
+            self.is_executing_command = False
             pythoncom.CoUninitialize()
 
     def clear_conversation_history(self):

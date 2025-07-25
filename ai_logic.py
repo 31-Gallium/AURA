@@ -37,7 +37,6 @@ def get_ollama_streaming_response(app, prompt, model_name):
         url = "http://localhost:11434/api/generate"
         payload = {"model": model_name, "prompt": prompt, "stream": True, "options": {"temperature": 0.6}}
         
-        # --- FIX: We need to wrap the generator logic to handle the return ---
         def generator():
             with requests.post(url, json=payload, stream=True, timeout=120) as response:
                 response.raise_for_status()
@@ -48,10 +47,9 @@ def get_ollama_streaming_response(app, prompt, model_name):
 
     except Exception as e:
         app.queue_log(f"Ollama Request Error: {e}", "ERROR")
-        # --- FIX: Return None on failure ---
-        return None
+        return iter([]) # Return an empty iterator on failure
     
-    
+
 def get_ollama_chat_response(app, messages, model_name, temperature=0.7, output_format=None):
     """
     A generic utility to get a response from an Ollama chat model.
@@ -62,7 +60,7 @@ def get_ollama_chat_response(app, messages, model_name, temperature=0.7, output_
     payload = {
         "model": model_name,
         "messages": messages,
-        "stream": False, # Streaming is disabled for more straightforward logic
+        "stream": False, 
         "options": {"temperature": temperature}
     }
 
@@ -76,97 +74,96 @@ def get_ollama_chat_response(app, messages, model_name, temperature=0.7, output_
             return content
     except Exception as e:
         app.queue_log(f"Ollama Request Error: {e}", "ERROR")
-        # --- FIX: Return None on failure ---
         return None
 
 
 
 # --- Main AI Logic Entry Point ---
-def get_ai_response(app, history, user_prompt):
+def get_tool_decision(app, history, user_prompt, model_name, available_tools):
     """
-    Handles complex/conversational queries using a two-step process:
-    1. Tool-Calling: Tries to use a tool for specific queries.
-    2. Conversational: If no tool is needed, generates a direct response.
+    Calls a specialized AI model (the Router) to decide which tool to use.
+    It returns a structured JSON object with the decision.
     """
-    full_text_future = Future()
+    log = app.queue_log
+    
+    # --- MODIFIED PROMPT ---
+    system_prompt = f"""You are a highly specialized AI that routes a user's request to the correct tool. Your ONLY job is to respond with a JSON object. Do not add any other text.
 
-    def stream_generator():
-        log = app.queue_log
-        
-        # --- DYNAMIC TOOL LOADING ---
-        # Fetch the list of all available tools from the command handler
-        available_tools = app.command_handler.get_tools_for_ai()
-        
-        # --- Step 1: Tool-Calling Attempt ---
-        tool_prompt_messages = [
-            {"role": "system", "content": f"""You are a helpful AI assistant with access to tools. Analyze the user's request and decide if a tool is needed.
-Respond with a JSON object. If a tool is needed, use the format: {{"tool_name": "tool_name", "parameters": {{"param_name": "value"}}}}.
-If no tool is needed, respond with: {{"tool_name": null}}.
+Your JSON response MUST contain two keys: 'tool_name' and 'parameters'.
+
+1.  Analyze the user's request to see if it matches any of the available tools.
+2.  If it matches a tool, provide the tool's name in the 'tool_name' field and extract any necessary arguments into the 'parameters' field.
+3.  If the request is general conversation (e.g., "hello", "thank you") or does not match any tool, you MUST set the 'tool_name' field to null.
 
 # AVAILABLE TOOLS:
-{json.dumps(available_tools, indent=2)}"""},
-            {"role": "user", "content": user_prompt}
-        ]
+{json.dumps(available_tools, indent=2)}
 
-        creator_model = app.config.get("ollama_model", "llama3.1")
-        log(f"Asking main AI ({creator_model}) for a tool decision...")
-        
-        raw_decision_response = get_ollama_chat_response(app, tool_prompt_messages, creator_model, temperature=0.2, output_format="json")
-        
-        try:
-            decision = json.loads(raw_decision_response)
-        except (json.JSONDecodeError, TypeError):
-            decision = {}
+# User's Request:
+{user_prompt}
 
-        tool_name = decision.get("tool_name")
+# RESPONSE (JSON only):
+"""
+    # --- END MODIFIED PROMPT ---
 
-        if tool_name:
-            log(f"AI chose to use tool: {tool_name}")
-            parameters = decision.get("parameters", {})
-            
-            # --- DYNAMIC TOOL DISPATCH ---
-            # Find the chosen tool in the command map to get its handler function
-            tool_data = app.command_handler.command_map.get(tool_name)
-            
-            if tool_data and 'handler' in tool_data:
-                tool_handler = tool_data['handler']
-                tool_result = tool_handler(app, **parameters)
-                
-                # --- NEW, MORE ROBUST ERROR HANDLING ---
-                # Check if the result is a dictionary with an 'error' key
-                if isinstance(tool_result, dict) and 'error' in tool_result:
-                    error_message = tool_result['error']
-                    log(f"Tool '{tool_name}' returned an error: {error_message}", "WARNING")
-                    full_text_future.set_result(error_message)
-                    yield error_message
-                    return # Stop further processing
+    messages = [
+        {"role": "system", "content": system_prompt}
+    ]
+    # --- THIS LINE IS NOW ACTIVE ---
+    messages.extend(history) 
+    messages.append({"role": "user", "content": user_prompt})
 
-                # If we get here, the tool was successful and returned a string.
-                final_prompt_messages = [
-                    {"role": "system", "content": "You are AURA, a helpful AI assistant. A tool has provided the following information. Use it to directly and concisely answer the user's original question. Do not mention that you used a tool or that you searched for information."},
-                    {"role": "user", "content": f"Information: '{tool_result}'\n\nOriginal Question: '{user_prompt}'"}
-                ]
+    log(f"Asking Router AI ({model_name}) for a tool decision...")
+    
+    raw_decision_response = get_ollama_chat_response(app, messages, model_name, temperature=0.0, output_format="json")
 
-                full_response_text = get_ollama_chat_response(app, final_prompt_messages, creator_model, temperature=0.7)
-                full_text_future.set_result(full_response_text)
-                yield full_response_text
-            else:
-                log(f"Could not find a handler for the chosen tool: {tool_name}", "ERROR")
-                yield f"I identified a tool to use ({tool_name}), but couldn't find the function to execute it."
+    try:
+        decision = json.loads(raw_decision_response)
+        # --- ADDED VALIDATION ---
+        if 'tool_name' not in decision or 'parameters' not in decision:
+            log(f"Router AI response is missing required keys. Response: {decision}", "WARNING")
+            return {"tool_name": None, "parameters": {}}
+        # --- END VALIDATION ---
+        log(f"Router AI decided: {decision}")
+        return decision
+    except (json.JSONDecodeError, TypeError):
+        log(f"Could not decode JSON from Router AI. Raw response: '{raw_decision_response}'", "ERROR")
 
-        else:
-            # --- Step 2: No tool was chosen, proceed with a conversational response ---
-            # ... (this part of the function remains exactly the same) ...
-            log("No tool chosen. Proceeding with conversational response.")
-            
-            conversation_messages = history + [{"role": "user", "content": user_prompt}]
+        return {"tool_name": None, "parameters": {}}
 
-            full_response_text = get_ollama_chat_response(app, conversation_messages, creator_model, temperature=0.8)
-            full_text_future.set_result(full_response_text)
-            yield full_response_text
 
-            
-    return stream_generator(), full_text_future
+def get_conversational_response_stream(app, history, user_prompt, model_name, tool_output=None):
+    """
+    Generates a natural, streaming response using the Chat model.
+    It now correctly includes conversation history for context.
+    """
+    log = app.queue_log
+    
+    # --- PROMPT CONSTRUCTION LOGIC ---
+    if tool_output:
+        # If a tool was used, the prompt is about synthesizing the result
+        system_prompt = "You are AURA, a helpful AI assistant. A tool has provided information. Use it to directly and concisely answer the user's original question. Do not mention the tool."
+        final_user_prompt = f"Information: '{tool_output}'\n\nOriginal Question: '{user_prompt}'"
+        log(f"Asking Chat AI ({model_name}) to synthesize tool output...")
+    else:
+        # If no tool was used, it's a direct conversational query
+        system_prompt = "You are AURA, a helpful and friendly AI assistant. Please provide a direct, conversational response to the user."
+        final_user_prompt = user_prompt
+        log(f"Asking Chat AI ({model_name}) for a conversational response...")
+
+    # --- NEW HISTORY FORMATTING ---
+    # Build the prompt string, including the full conversation history
+    full_prompt_for_streaming = f"{system_prompt}\n\n"
+    for message in history:
+        if message['role'] == 'user':
+            full_prompt_for_streaming += f"USER: {message['content']}\n"
+        elif message['role'] == 'model':
+            full_prompt_for_streaming += f"ASSISTANT: {message['content']}\n"
+    
+    # Add the latest user prompt
+    full_prompt_for_streaming += f"USER: {final_user_prompt}\nASSISTANT:"
+    # --- END NEW HISTORY FORMATTING ---
+
+    return get_ollama_streaming_response(app, full_prompt_for_streaming, model_name)
 
 def answer_question_on_summary(app_controller, summary, question):
     """Uses the selected AI to answer a question based on a provided summary."""
@@ -174,7 +171,6 @@ def answer_question_on_summary(app_controller, summary, question):
     log_callback = app_controller.queue_log
     ai_engine = config.get("ai_engine", "gemini_online")
 
-    # --- FIX: Create messages in the correct format ---
     messages = [
         {"role": "system", "content": "Based ONLY on the provided meeting notes below, answer the user's question. Do not use any outside knowledge. If the answer is not in the notes, say so."},
         {"role": "user", "content": f"--- MEETING NOTES ---\n{summary}\n\n--- USER QUESTION ---\n{question}\n\n--- ANSWER ---"}
@@ -183,7 +179,6 @@ def answer_question_on_summary(app_controller, summary, question):
     if ai_engine == "ollama_offline":
         model_name = config.get("ollama_model", "llama3")
         log_callback(f"Answering question on summary with Ollama model: {model_name}")
-        # --- FIX: Call the correct function ---
         return get_ollama_chat_response(app_controller, messages, model_name)
     else: # Default to Gemini Online
         log_callback("Answering question on summary with Gemini.")
@@ -191,7 +186,6 @@ def answer_question_on_summary(app_controller, summary, question):
         if not answer_model:
             return "Cannot answer question: Gemini model is not initialized."
         try:
-            # Gemini's API uses a different format, so we keep the old prompt style here
             prompt = f"Based ONLY on the provided meeting notes below, answer the user's question. Do not use any outside knowledge. If the answer is not in the notes, say so.\n\n--- MEETING NOTES ---\n{summary}\n\n--- USER QUESTION ---\n{question}\n\n--- ANSWER ---"
             response = answer_model.generate_content(prompt)
             return response.text.strip()
@@ -205,7 +199,6 @@ def generate_session_title(app_controller, text_to_title):
     log_callback = app_controller.queue_log
     ai_engine = config.get("ai_engine", "gemini_online")
 
-    # --- FIX: Create messages in the correct format ---
     messages = [
         {"role": "system", "content": "Analyze the following text from a meeting. Create a short, descriptive title (3-5 words) that accurately describes the main topic. Respond with ONLY the title itself, and nothing else."},
         {"role": "user", "content": f"--- TEXT ---\n{text_to_title}\n\n--- TITLE ---"}
@@ -215,7 +208,6 @@ def generate_session_title(app_controller, text_to_title):
 
     if ai_engine == "ollama_offline":
         model_name = config.get("ollama_model", "llama3")
-        # --- FIX: Call the correct function ---
         title = get_ollama_chat_response(app_controller, messages, model_name)
         return title.strip().strip('"')
     else: # Default to Gemini Online
@@ -223,7 +215,6 @@ def generate_session_title(app_controller, text_to_title):
         if not answer_model:
             return "Untitled Session"
         try:
-            # Gemini's API uses a different format, so we keep the old prompt style here
             prompt = f"Analyze the following text from a meeting. Create a short, descriptive title (3-5 words) that accurately describes the main topic. Respond with ONLY the title itself, and nothing else.\n\n--- TEXT ---\n{text_to_title}\n\n--- TITLE ---"
             response = answer_model.generate_content(prompt)
             return response.text.strip().strip('"')
